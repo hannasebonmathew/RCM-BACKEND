@@ -6,17 +6,18 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
 const Razorpay = require("razorpay");
-const { Client, RemoteAuth } = require("whatsapp-web.js");
-const { MongoStore } = require("wwebjs-mongo");
-const QRCode = require("qrcode"); // For generating browser-viewable QR images
 
 process.on('uncaughtException', (err) => {
-  if (err.code === 'ENOENT' && err.path?.includes('RemoteAuth')) {
-    console.warn("⚠️ Handled background RemoteAuth zip stream error safely.");
+  if (err.code === 'ECONNRESET' || err.message?.includes('ECONNRESET')) {
+    console.warn("⚠️ Caught transient MongoDB ECONNRESET error safely:", err.message);
     return;
   }
   console.error("Uncaught Exception:", err);
   process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error("⚠️ Unhandled Rejection at:", promise, "reason:", reason);
 });
 
 const {
@@ -26,15 +27,11 @@ const {
   CLIENT_URL = "*",
   RAZORPAY_KEY_ID,
   RAZORPAY_KEY_SECRET,
-  ADMIN_EMAIL,
-  ADMIN_PASSWORD,
-  ADMIN_WHATSAPP_PHONE,
-  WHATSAPP_TOKEN,
-  WHATSAPP_PHONE_NUMBER_ID,
+  TELEGRAM_BOT_TOKEN,
+  TELEGRAM_CHAT_ID,
 } = process.env;
-if (!JWT_SECRET) throw new Error("JWT_SECRET is required in .env");
 
-let whatsappClient;
+if (!JWT_SECRET) throw new Error("JWT_SECRET is required in .env");
 
 // ---------- Business rules & Store Coordinates ----------
 const MIN_ORDER_AMOUNT = 1000; // Minimum order subtotal required
@@ -80,7 +77,7 @@ const userSchema = new mongoose.Schema(
     phone: { type: String, trim: true },
     password: { type: String, required: true, select: false },
     role: { type: String, enum: ["customer", "admin"], default: "customer" },
-    isNrpAllowed: { type: Boolean, default: false }, // 👈 Controls NRP access per user
+    isNrpAllowed: { type: Boolean, default: false }, 
   },
   { timestamps: true },
 );
@@ -185,25 +182,14 @@ app.get("/api/auth/me", requireAuth, (req, res) => res.json({ user: publicUser(r
 // ---------- Simple Password Reset (No Token Required) ----------
 app.post("/api/auth/simple-reset-password", ah(async (req, res) => {
   const { email, newPassword } = req.body;
+  if (!email || !newPassword) throw httpError(400, "Email and new password are required");
+  if (newPassword.length < 6) throw httpError(400, "Password must be at least 6 characters long");
 
-  if (!email || !newPassword) {
-    throw httpError(400, "Email and new password are required");
-  }
-
-  if (newPassword.length < 6) {
-    throw httpError(400, "Password must be at least 6 characters long");
-  }
-
-  // Find user by email
   const user = await User.findOne({ email: String(email).toLowerCase() });
-  if (!user) {
-    throw httpError(404, "No account found with this email");
-  }
+  if (!user) throw httpError(404, "No account found with this email");
 
-  // Hash and save the new password
   user.password = await bcrypt.hash(newPassword, 10);
   await user.save();
-
   res.json({ ok: true, message: "Password updated successfully. You can now log in." });
 }));
 
@@ -251,10 +237,7 @@ app.get(["/api/products", "/products"], optionalAuth, ah(async (req, res) => {
     Product.countDocuments(filter),
   ]);
 
-  // Determine if the requesting user has permission for NRP pricing
   const allowNrp = req.user?.role === "admin" || req.user?.isNrpAllowed === true;
-
-  // Format products based on user permissions (fallback to MRP if NRP not allowed)
   const formattedItems = items.map((p) => {
     const obj = p.toObject();
     return {
@@ -316,14 +299,12 @@ async function buildOrder(items, address = {}, user = null) {
     if (!(q > 0)) throw httpError(400, "Invalid quantity");
     if (q > p.stock) throw httpError(400, `Only ${p.stock} left of ${p.name}`);
     
-    // Enforce pricing according to customer permission status at checkout
     const activePrice = allowNrp ? p.nrp : p.mrp;
     lines.push({ product: p._id, name: p.name, price: activePrice, mrp: p.mrp, qty: q, image: p.images?.[0] });
   }
 
   const subtotal = lines.reduce((s, l) => s + l.price * l.qty, 0);
 
-  // 🛑 Enforce Minimum Order Amount of ₹1,000
   if (subtotal < MIN_ORDER_AMOUNT) {
     throw httpError(400, `Minimum order amount is ₹${MIN_ORDER_AMOUNT}. Your current subtotal is ₹${subtotal}.`);
   }
@@ -342,6 +323,50 @@ function validateAddress(a = {}) {
 const decrementStock = (items) =>
   Promise.all(items.map((l) => Product.updateOne({ _id: l.product }, { $inc: { stock: -l.qty } })));
 const newOrderId = () => `HSM-${Date.now().toString(36).toUpperCase()}${crypto.randomBytes(2).toString("hex").toUpperCase()}`;
+
+// Telegram Notification Helper
+async function sendTelegramNotification(order) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    console.log("Telegram credentials missing in environment variables. Skipping notification.");
+    return;
+  }
+
+  const addr = order.address;
+  const itemsList = order.items.map(i => `• ${i.name} x ${i.qty} (₹${i.price * i.qty})`).join("\n");
+  
+  const text = 
+    `🛒 *New Order Received!* (\`${order.orderId}\`)\n\n` +
+    `👤 *Customer:* ${addr.name}\n` +
+    `📞 *Phone:* ${addr.phone}\n` +
+    `📧 *Email:* ${addr.email}\n\n` +
+    `📍 *Address:*\n` +
+    `${addr.line1}${addr.line2 ? `, ${addr.line2}` : ""}\n` +
+    `${addr.city}, ${addr.district}, ${addr.state}\n\n` +
+    `📦 *Items:*\n${itemsList}\n\n` +
+    `🚚 *Shipping:* ₹${order.shipping}\n` +
+    `💰 *Total:* ₹${order.total} (${order.paymentMethod})`;
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: text,
+        parse_mode: "Markdown",
+      }),
+    });
+    
+    if (res.ok) {
+      console.log(`✅ Telegram alert sent for order ${order.orderId}`);
+    } else {
+      const err = await res.json();
+      console.error("Telegram API Error:", err.description);
+    }
+  } catch (err) {
+    console.error("Failed to send Telegram notification:", err.message);
+  }
+}
 
 // Price quote for the cart
 app.post("/api/orders/quote", optionalAuth, ah(async (req, res) => {
@@ -362,9 +387,7 @@ app.post("/api/orders", optionalAuth, ah(async (req, res) => {
   });
   await decrementStock(o.items);
 
-  if (ADMIN_WHATSAPP_PHONE) {
-    sendWhatsAppNotification(ADMIN_WHATSAPP_PHONE, order).catch(console.error);
-  }
+  sendTelegramNotification(order).catch(console.error);
 
   res.status(201).json(order);
 }));
@@ -398,9 +421,7 @@ app.post("/api/payments/razorpay/verify", optionalAuth, ah(async (req, res) => {
   });
   await decrementStock(o.items);
 
-  if (ADMIN_WHATSAPP_PHONE) {
-    sendWhatsAppNotification(ADMIN_WHATSAPP_PHONE, order).catch(console.error);
-  }
+  sendTelegramNotification(order).catch(console.error);
 
   res.status(201).json(order);
 }));
@@ -470,78 +491,6 @@ app.get("/api/admin/stats", requireAdmin, ah(async (_req, res) => {
   res.json({ orders, revenue: revenue[0]?.sum ?? 0, customers, lowStock });
 }));
 
-app.get("/", (_req, res) => {
-  res.redirect("/qr");
-});
-
-// --- BROWSER QR ENDPOINT ---
-app.get("/qr", async (req, res) => {
-  if (isAuthenticated) {
-    return res.send(`
-      <div style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-        <h2 style="color: #2e7d32;">✅ WhatsApp is already connected and ready!</h2>
-      </div>
-    `);
-  }
-
-  if (!qrCodeData) {
-    return res.send(`
-      <div style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-        <h2>⏳ Generating QR Code... Please refresh in a few seconds.</h2>
-      </div>
-    `);
-  }
-
-  try {
-    const qrImageUrl = await QRCode.toDataURL(qrCodeData);
-    res.send(`
-      <div style="font-family: sans-serif; text-align: center; padding-top: 40px;">
-        <h2>Scan WhatsApp QR Code</h2>
-        <img src="${qrImageUrl}" alt="WhatsApp QR Code" style="width: 300px; height: 300px; border: 1px solid #ccc; padding: 10px; border-radius: 8px;"/>
-        <p>Open WhatsApp on your phone > <b>Linked Devices</b> > <b>Link a Device</b></p>
-        <script>
-          setTimeout(() => location.reload(), 15000);
-        </script>
-      </div>
-    `);
-  } catch (err) {
-    res.status(500).send("Error generating QR code image");
-  }
-});
-// WhatsApp Notification Helper function
-// ---------- Updated WhatsApp Notification Helper (whatsapp-web.js) ----------
-async function sendWhatsAppNotification(adminPhone, orderDetails) {
-  if (!adminPhone) {
-    console.log("ADMIN_WHATSAPP_PHONE missing in .env. Skipping notification.");
-    return;
-  }
-
-  const addr = orderDetails.address;
-  const itemsList = orderDetails.items.map(i => `- ${i.name} x ${i.qty} (₹${i.price * i.qty})`).join("\n");
-
-  const messageText = 
-    `🛒 *New Order Received!* (${orderDetails.orderId})\n\n` +
-    `👤 *Customer:* ${addr.name}\n` +
-    `📞 *Phone:* ${addr.phone}\n` +
-    `📧 *Email:* ${addr.email}\n\n` +
-    `📍 *Delivery Address:*\n` +
-    `${addr.line1}${addr.line2 ? `, ${addr.line2}` : ""}\n` +
-    `${addr.city}, ${addr.district}, ${addr.state}\n\n` +
-    `📦 *Items:*\n${itemsList}\n\n` +
-    `🚚 *Shipping:* ₹${orderDetails.shipping}\n` +
-    `💰 *Total Amount:* ₹${orderDetails.total} (${orderDetails.paymentMethod})`;
-
-  try {
-    const chatId = `${adminPhone.replace(/\D/g, "")}@c.us`;
-    await whatsappClient.sendMessage(chatId, messageText);
-    console.log(`Successfully sent WhatsApp order notification to ${adminPhone}`);
-  } catch (err) {
-    console.error("Failed to send WhatsApp notification via web client:", err.message);
-  }
-}
-let qrCodeData = "";
-let isAuthenticated = false;
-
 // ---------- Health & errors ----------
 app.get("/api/health", (_req, res) => res.json({ ok: true, store: "HANNAN SUPERMARKET-RCM PUDUKKAD" }));
 app.use((_req, _res, next) => next(httpError(404, "Not found")));
@@ -551,68 +500,12 @@ app.use((err, _req, res, _next) => {
   res.status(status).json({ error: status === 500 ? "Something went wrong" : err.message });
 });
 
-mongoose.connect(MONGO_URI).then(async () => {
-  const store = new MongoStore({ mongoose: mongoose });
-
-  whatsappClient = new Client({
-    authStrategy: new RemoteAuth({
-      store: store,
-      clientId: "hannan-store-admin",
-      dataPath: "./wwebjs_auth",
-      backupSyncIntervalMs: 300000,
-    }),
-    puppeteer: {
-      headless: true,
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium",
-      args: [
-        "--no-sandbox", 
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-accelerated-2d-canvas",
-        "--no-first-run",
-        "--no-zygote",
-        "--single-process",
-        "--disable-gpu"
-      ],
-    },
-  });
-
-  whatsappClient.on("qr", (qr) => {
-    console.log("📲 New QR code received! Open http://localhost:5000/qr in your browser to scan.");
-    qrCodeData = qr;
-    isAuthenticated = false;
-  });
-
-  whatsappClient.on("authenticated", () => {
-    console.log("🔒 WhatsApp authenticated successfully.");
-    isAuthenticated = true;
-    qrCodeData = "";
-  });
-
-  whatsappClient.on("remote_session_saved", () => {
-    console.log("💾 WhatsApp session backed up to MongoDB successfully!");
-  });
-
-  whatsappClient.on("ready", () => {
-    console.log("✅ WhatsApp Client is connected and ready to send notifications!");
-    isAuthenticated = true;
-    qrCodeData = "";
-  });
-
-  whatsappClient.on("error", (err) => {
-    if (err.code === "ENOENT" || err.syscall === "open") {
-      console.warn("⚠️ Handled background session zip stream warning. Continuing operation...");
-    } else {
-      console.error("❌ WhatsApp client unhandled error:", err);
-    }
-  });
-
-whatsappClient.initialize().catch((err) => {
-  console.error("WhatsApp initialization failed:", err);
-});
-
+mongoose.connect(MONGO_URI, {
+  serverSelectionTimeoutMS: 10000,
+  socketTimeoutMS: 45000,
+}).then(() => {
   app.listen(PORT, () => console.log(`HANNAN SUPERMARKET API running on http://localhost:${PORT}`));
 }).catch((e) => { 
-  console.error("MongoDB connection failed:", e.message); 
+  console.log("MongoDB connection failed:", e.message); 
   process.exit(1); 
 });
